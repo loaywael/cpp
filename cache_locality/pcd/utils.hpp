@@ -3,9 +3,11 @@
 #include <vector>
 #include <memory>
 #include <numeric>
+#include <new>       // Required for placement new
 #include <random>
 #include <cstdlib>
 #include <fstream>
+#include <execution>
 
 
 class Point3D {
@@ -32,6 +34,7 @@ struct PointCloudSoA {
     std::vector<float> z;
     PointCloudSoA() = default;
     PointCloudSoA(size_t n) : x(n), y(n), z(n) {}
+    size_t size() const { return x.size(); }
 };
 
 inline PointCloud generate_pc(size_t n) {
@@ -131,6 +134,51 @@ inline Point3D soa_findMassCenter(const PointCloudSoA& cloud) {
     return {sumX/size, sumY/size, sumZ/size};
 }
 
+inline Point3D simd_findMassCenterr(const PointCloudSoA& cloud) {
+    float n_points = static_cast<float>(cloud.size());
+    float sumX=0.0f, sumY=0.0f, sumZ=0.0f;
+    sumX = std::reduce(
+        cloud.x.begin(),
+        cloud.x.end(),
+        0.0f
+    );
+    sumY = std::reduce(
+        cloud.y.begin(),
+        cloud.y.end(),
+        0.0f
+    );
+    sumZ = std::reduce(
+        cloud.z.begin(),
+        cloud.z.end(),
+        0.0f
+    );
+    return {sumX/n_points, sumY/n_points, sumZ/n_points};
+}
+
+inline Point3D simd_findMassCenterr_par(const PointCloudSoA& cloud) {
+    float n_points = static_cast<float>(cloud.size());
+    float sumX=0.0f, sumY=0.0f, sumZ=0.0f;
+    sumX = std::reduce(
+        std::execution::par_unseq,
+        cloud.x.begin(),
+        cloud.x.end(),
+        0.0f
+    );
+    sumY = std::reduce(
+        std::execution::par_unseq,
+        cloud.y.begin(),
+        cloud.y.end(),
+        0.0f
+    );
+    sumZ = std::reduce(
+        std::execution::par_unseq,
+        cloud.z.begin(),
+        cloud.z.end(),
+        0.0f
+    );
+    return {sumX/n_points, sumY/n_points, sumZ/n_points};
+}
+
 inline std::vector<Point3D> load_pc_file(const std::string& file_path) {
     std::ifstream file(file_path, std::ios::in | std::ios::binary);
     if (!file.is_open()) {
@@ -147,3 +195,31 @@ inline std::vector<Point3D> load_pc_file(const std::string& file_path) {
     );
     return cloud;
 }
+
+class Arena {
+private:
+    std::unique_ptr<std::byte[]> buffer;
+    size_t size = 0;
+    size_t offset = 0;
+public:
+    explicit Arena(size_t n) : size(n), buffer(std::make_unique<std::byte[]>(n)) {}
+    void* allocate(size_t n, size_t alignment=alignof(std::max_align_t)) {
+        void* current_ptr = buffer.get() + offset;
+        size_t remaining_space = size - offset;
+        void* aligned_ptr = std::align(alignment, n, current_ptr, remaining_space);
+        if (!aligned_ptr) {
+            throw std::bad_alloc();
+        }
+        offset = static_cast<std::byte*>(aligned_ptr) + n - buffer.get();
+        return aligned_ptr;
+    }
+    void reset() noexcept {
+        offset = 0;
+    }
+
+    template <typename T, typename... Args>
+    T* construct(Args&&... args) {
+        void* memory = allocate(sizeof(T), alignof(T));
+        return ::new (memory) T(std::forward<Args>(args)...);
+    }
+};

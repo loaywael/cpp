@@ -199,3 +199,50 @@ Overwriting: New points write directly over the oldest points in the contiguous 
 Zero Allocations: Once running, the allocation count is zero, preventing any CPU pauses or memory fragmentation during operation.
 C. Struct of Arrays (SoA) for Processing pipelines
 If the system is running heavy calculations (e.g., normal estimation, downsampling, or ground plane detection), the loader reads the binary packet directly into an SoA structure. This ensures that the GPU or CPU SIMD cores can crunch through the coordinates with maximum cache efficiency.
+
+
+## Memory Allocation
+1. Allocation Count: 100,000,000 vs. 1 Allocation
+Every time you call new, std::malloc(), or std::make_unique(), the CPU has to pause your program and hand control over to the OS Heap Allocator (e.g., glibc allocator on Linux).
+
+Naive Approach (100,000,000 Allocations): The allocator has to run its internal search algorithm 100M times, find a free slot of 24 bytes in the heap, register its metadata (adding 8–16 bytes of bookkeeping overhead per point!), and return it. This takes a massive amount of time and completely fragmentizes your RAM.
+AoS / SoA (1 Allocation): When you run std::vector::reserve(N), the OS allocator is called exactly once to request one giant contiguous block of 1.2GB. This takes practically 0 milliseconds!
+2. Page Faults (The Silent Performance Killer)
+When you allocate 1.2GB of contiguous memory using std::vector, the operating system does not actually hand you 1.2GB of physical RAM stick memory immediately. Instead, it uses Lazy Allocation:
+
+The OS returns a range of Virtual Memory Addresses but keeps the physical RAM unmapped.
+The first time your loop tries to write to or read from a memory page (usually 4KB chunks), the CPU triggers a hardware interrupt called a Page Fault.
+The OS pauses your thread, searches physical RAM for a free 4KB page, maps it to your virtual address space, and resumes your thread.
+For a 1.2GB dataset, your program will trigger 300,000 Page Faults! The very first loop that initializes or touches the point cloud is forced to pay this heavy tax, which is why point cloud generation or loading times are dominated by page fault latency.
+
+3. Mutex Locking in Multi-Threaded Allocations
+In multi-threaded applications (like your SIMD Parallel version), memory allocation can bottleneck your CPU cores due to Mutex Locks.
+
+Standard memory allocators share a single global heap. If multiple threads try to run new or std::make_unique at the same time:
+
+Thread A locks the heap mutex to allocate memory.
+Thread B, C, and D are forced to stall (sleep) until Thread A finishes and unlocks the mutex. This completely destroys the benefit of having an AMD Ryzen 9 with 32 threads, as they all end up queuing up behind a single mutex!
+
+1. The Trap of Lock-Free Queues: Hardware-Level Contention
+Many developers think "lock-free = fast." While it is much faster than using a traditional std::mutex (which suspends the thread and yields to the OS kernel), a lock-free queue is not free.
+
+If 32 threads try to push to the lock-free queue simultaneously, only one thread will succeed on the first attempt.
+The other 31 threads will fail the compare_exchange check and loop back to try again.
+Cache Line Invalidation (MESI Protocol): Every time a thread successfully updates the tail pointer, it invalidates the cache line for that pointer across all other CPU cores. All other 31 cores must pause, evict their L1 cache, and reload the pointer from L3 cache or RAM.
+This causes massive hardware-level stalling (known as cache bouncing or atomic thrashing).
+
+2. Why the Arena Allocator Wins on Pure Speed
+An Arena Allocator achieves its speed by avoiding synchronization entirely.
+
+Instead of sharing one allocator among threads, we give each thread its own Thread-Local Arena. Because Thread 1 never accesses the Arena of Thread 2:
+
+There are no locks.
+There are no atomic operations.
+There is no cache bouncing.
+Memory allocations execute in less than $1$ CPU clock cycle (a simple pointer addition!).
+🤝 The Production Setup: The Ultimate Combo
+In production engines (like Unreal Engine or AAA physics solvers), we don't choose between them. We combine them!
+
+We use a Lock-Free Queue (configured as a Work-Stealing Queue) to distribute point cloud chunks (e.g., 1024-point blocks) to your Ryzen 9 cores.
+Once a CPU core pops a chunk from the queue, it uses its own Thread-Local Arena to allocate any temporary memory it needs to calculate normal vectors or compute physics.
+This ensures that the inter-thread scheduling is thread-safe and lock-free, while the actual heavy-duty crunching runs at raw contiguous SIMD speed without ever touching an atomic variable!

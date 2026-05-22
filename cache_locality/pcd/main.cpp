@@ -5,7 +5,7 @@
 
 
 int main() {
-    constexpr size_t N = 10000000; // 10 million points
+    constexpr size_t N = 100000000; // 10 million points
     std::cout << "Starting comparison with " << N << " points...\n";
     
     // ==========================================
@@ -74,4 +74,25 @@ int main() {
     std::cout << "--- SoA Approach Results ---" << std::endl;
     std::cout << "Center: (" << center_soa.x << ", " << center_soa.y << ", " << center_soa.z << ")" << std::endl;
     std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_soa - start_soa).count() << " ms" << std::endl;
+
+    // ==========================================
+    // ⚡ SIMD Implementation
+    // ==========================================
+    std::cout << "\nCalculating center (SIMD)..." << std::endl;
+    auto start_simd = std::chrono::high_resolution_clock::now();
+    Point3D center_simd = simd_findMassCenterr(cloudSoA);
+    auto end_simd = std::chrono::high_resolution_clock::now();
+    
+    std::cout << "--- SIMD Approach Results ---" << std::endl;
+    std::cout << "Center: (" << center_simd.x << ", " << center_simd.y << ", " << center_simd.z << ")" << std::endl;
+    std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_simd - start_simd).count() << " ms" << std::endl;
+
+    std::cout << "\nCalculating center (SIMD Parallel)..." << std::endl;
+    auto start_simd_par = std::chrono::high_resolution_clock::now();
+    Point3D center_simd_par = simd_findMassCenterr_par(cloudSoA);
+    auto end_simd_par = std::chrono::high_resolution_clock::now();
+    
+    std::cout << "--- SIMD (Parallel) Approach Results ---" << std::endl;
+    std::cout << "Center: (" << center_simd_par.x << ", " << center_simd_par.y << ", " << center_simd_par.z << ")" << std::endl;
+    std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_simd_par - start_simd_par).count() << " ms" << std::endl;
 }
