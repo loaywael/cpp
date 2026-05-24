@@ -6,14 +6,20 @@ This repository serves as a practical reference for understanding, analyzing, an
 
 ## 📊 Quantitative Performance Comparison
 
-The following benchmarks were recorded by running the comparison suite on **10,000,000 points**:
+The following benchmarks were recorded by running the comparison suite across three point cloud sizes (**1,000,000**, **10,000,000**, and **100,000,000** points) under identical system load:
 
-| Implementation | Execution Time | Speedup Ratio | Memory Footprint (per Point) | Cache Quality |
-| :--- | :---: | :---: | :---: | :--- |
-| ❌ **Naive** (`vector<unique_ptr<Point3D>>`) | **~268 ms** | **1.0x** (Baseline) | **32 Bytes** <br>*(12B Data + 8B Pointer + 8B VTable)* | Extremely Poor (Cache Miss Storm) |
-| ⚡ **AoS (Unaligned)** (`vector<Point3D>`) | **53 ms** | 🚀 **~5.1x Faster** | **12 Bytes** <br>*(Packed x, y, z)* | Excellent (Spatial Locality) |
-| ⚡ **Aligned AoS** (`vector<Point3D16>`) | **55 ms** | 🚀 **~4.9x Faster** | **16 Bytes** <br>*(12B Data + 4B Padding)* | Very Good (Aligned but 33% larger) |
-| 🚀 **SoA (Structure of Arrays)** | **44 ms** | 🔥 **~6.1x Faster** | **12 Bytes** <br>*(No padding, isolated streams)* | Best (Ideal Cache Packaging) |
+| Implementation | 1M Points (Speedup) | 10M Points (Speedup) | 100M Points (Speedup) | Memory (per Point) | Cache Quality |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| ❌ **Naive** (`vector<unique_ptr<Point3D>>`) | **1.49 ms** <br>*(1.00x Baseline)* | **16.05 ms** <br>*(1.00x Baseline)* | **139.91 ms** <br>*(1.00x Baseline)* | **32 Bytes** <br>*(24B Point3D + 8B Pointer)* | Extremely Poor (Cache Miss Storm & Heap Fragmentation) |
+| ⚡ **AoS (Unaligned)** (`vector<Point3D>`) | **0.75 ms** <br>*(🚀 ~1.99x)* | **11.73 ms** <br>*(🚀 ~1.37x)* | **101.48 ms** <br>*(🚀 ~1.38x)* | **24 Bytes** <br>*(12B Data + 8B VTable + 4B Padding)* | Poor to Moderate (Contiguous but bloated by VTable) |
+| ⚡ **Aligned AoS** (`vector<Point3D16>`) | **0.70 ms** <br>*(🚀 ~2.13x)* | **8.26 ms** <br>*(🚀 ~1.94x)* | **81.23 ms** <br>*(🚀 ~1.72x)* | **16 Bytes** <br>*(12B Data + 4B Padding, No VTable)* | Very Good (Contiguous, aligned, no VTable pointer) |
+| 🚀 **SoA (Structure of Arrays)** | **0.73 ms** <br>*(🚀 ~2.04x)* | **9.13 ms** <br>*(🚀 ~1.76x)* | **74.30 ms** <br>*(🔥 ~1.88x)* | **12 Bytes** <br>*(Packed x, y, z streams)* | Best (Perfect spatial locality for coordinates) |
+| ⚡ **SIMD (SoA + `std::reduce`)** | **0.49 ms** <br>*(🚀 ~3.04x)* | **6.04 ms** <br>*(🔥 ~2.66x)* | **61.93 ms** <br>*(🔥 ~2.26x)* | **12 Bytes** <br>*(Packed x, y, z streams)* | Outstanding (Unlocks hardware vectorization) |
+| 💥 **SIMD (Parallel)** (`par_unseq`) | **1.04 ms** <br>*(⚠️ ~1.43x)* | **3.59 ms** <br>*(💥 ~4.47x)* | **38.16 ms** <br>*(💥 ~3.67x)* | **12 Bytes** <br>*(Packed x, y, z streams)* | Outstanding (Parallel SIMD across cores) |
+
+> [!NOTE]
+> **Why is SIMD Parallel slower at 1M points?**
+> For smaller datasets (like 1,000,000 points), the overhead of thread spawning, pool synchronization, and task distribution in `std::execution::par_unseq` is larger than the actual computation time (~0.49 ms). As the dataset grows to 10M and 100M points, this thread scheduling overhead becomes negligible, allowing the hardware concurrency to scale and deliver massive speedups (~3.67x).
 
 ---
 
@@ -70,16 +76,16 @@ graph LR
     end
 ```
 
-### ⚡ Why AoS achieved a **~5.1x Speedup**:
-* **True Spatial Locality**: All `Point3D` data is fully contiguous. When the CPU fetches the first point, the L1/L2 hardware pre-fetcher automatically loads subsequent points into the cache.
-* **No Pointer Indirection**: Accessing elements is direct (`cloud[i].x`), avoiding the `unique_ptr` lookup.
-* **Zero Allocation Overhead**: One giant allocation for the entire vector instead of 10 million tiny allocations on the heap.
+### ⚡ Why AoS achieved a **~1.37x Speedup**:
+* **True Spatial Locality**: All `Point3D` data is contiguous. When the CPU fetches the first point, the hardware pre-fetcher automatically loads subsequent points into cache.
+* **No Pointer Indirection**: Accessing elements is direct (`cloud[i].x`), avoiding the `unique_ptr` heap lookup.
+* **Zero Allocation Overhead**: A single large allocation for the entire vector instead of 100 million fragmented heap allocations.
 
-### 🔍 Unaligned AoS (53ms) vs. Aligned AoS (55ms)
-You might wonder why **Aligned AoS (`Point3D16`)** was slightly slower than **Unaligned AoS (`Point3D`)** in this benchmark.
-* **Padding Overhead**: Marking `Point3D16` with `alignas(16)` forces the compiler to pad each struct from **12 bytes to 16 bytes**. 
-* **Data Density**: This 4-byte padding means you are transferring **33% more data** from RAM to the CPU cache during the scalar summation loop. Since the scalar loop doesn't take advantage of explicit SIMD registers, the higher cache density of the unaligned version wins.
-* **When to use Aligned**: Use alignment when you are explicitly using SSE/AVX vector assembly or compiler intrinsics (e.g., loading 4 points at once into a 128-bit vector register).
+### 🔍 Unaligned AoS (100ms) vs. Aligned AoS (82ms)
+You might notice that **Aligned AoS (`Point3D16`)** is significantly faster than **Unaligned AoS (`Point3D`)** in this benchmark.
+* **Virtual Destructor Overhead**: `Point3D` has a `virtual ~Point3D() = default;`. This introduces a virtual table pointer (`vptr`), inflating the size of `Point3D` to **24 bytes** (12B data + 8B `vptr` + 4B compiler alignment padding).
+* **Data Density**: `Point3D16` has no virtual methods or destructor, so it requires no `vptr`. Marked with `alignas(16)`, it occupies only **16 bytes** (12B data + 4B padding).
+* **Why Aligned Wins**: Because `Point3D16` is 33% smaller (16 bytes vs. 24 bytes), it has higher data density in the L1/L2 caches and requires significantly less memory bandwidth, leading to a **~1.22x speedup** over `Point3D`.
 
 ---
 
@@ -108,10 +114,30 @@ graph TD
     end
 ```
 
-### ⚡ Why SoA achieved the maximum **~6.1x Speedup**:
+### ⚡ Why SoA achieved a **~1.90x Speedup**:
 * **Ideal Memory Layout**: Each coordinate list (`x`, `y`, and `z`) is a 100% packed, contiguous flat array of `float`s with **zero padding** and **zero overhead**.
-* **Cache Line Packing**: Every byte of the L1/L2 cache line fetched from RAM is highly utilized. When adding `x` coordinates, the CPU only loads `x` data without wasting cache space on `y` or `z`.
-* **Auto-Vectorization**: The simplicity of flat, parallel float arrays allows modern compilers to easily auto-vectorize loops (e.g., executing multiple coordinate additions in a single CPU clock cycle using SIMD instructions like AVX).
+* **Cache Line Packing**: Every byte of the L1/L2 cache line fetched from RAM is highly utilized. When adding coordinates, the CPU only loads relevant coordinate data without wasting cache space.
+* **Auto-Vectorization**: The simplicity of flat, parallel float arrays allows modern compilers to easily auto-vectorize loops.
+
+---
+
+## ⚡ Solution 3: SIMD Vectorization (`std::reduce`)
+
+To push performance even further, we can leverage explicit vector instructions. By using `std::reduce` on our flat, contiguous SoA coordinate arrays, we enable the compiler to generate highly optimized SIMD instructions (like AVX-256 or AVX-512) that process multiple elements per cycle.
+
+### Why SIMD achieved a **~2.28x Speedup**:
+* **Vectorized Execution**: The CPU loads 8 floats (256-bit AVX) at a time into wide vector registers and adds them in a single clock cycle.
+* **Reduced Loop Overhead**: Instead of individual scalar floating-point instructions, the loop executes a fraction of the total operations.
+
+---
+
+## 💥 Solution 4: SIMD Parallel Execution (`std::reduce` + `std::execution::par_unseq`)
+
+Finally, we scale our SIMD implementation across all available CPU threads using the parallel execution policy `std::execution::par_unseq`.
+
+### Why SIMD (Parallel) achieved a **~3.61x Speedup**:
+* **Multi-Core Exploitation**: The coordinate summation is split into chunks and processed in parallel across all CPU cores.
+* **Vectorized Threads**: Each worker thread uses SIMD instructions to process its local chunk of memory, combining hardware-level concurrency with data-level parallelism.
 
 ---
 
@@ -130,25 +156,25 @@ By default, the compiler aligns a struct based on its largest member. For Point3
 alignas(16) is a compiler directive instructing the compiler to ensure that every instance of this struct begins at a memory address that is a multiple of 16 bytes (e.g., 0x10, 0x20, 0x30, etc.).
 To enforce this 16-byte boundary when allocating structs in a contiguous array, the compiler must pad the size of the struct to a multiple of 16 bytes.
 
-2. Difference: Unaligned AoS (12B) vs. Aligned AoS (16B)
+2. Difference: Unaligned AoS (24B) vs. Aligned AoS (16B)
 Let's look at how these two layouts reside inside the CPU Cache and RAM:
 
 ```
-Unaligned AoS (Point3D - 12 Bytes):
-[ x0 | y0 | z0 ][ x1 | y1 | z1 ][ x2 | y2 | z2 ][ x3 | y3 | z3 ][ x4 | y4 | z4 ][ x5 ...
-  ^-- Point 0 --^  ^-- Point 1 --^  ^-- Point 2 --^  ^-- Point 3 --^  ^-- Point 4 --^
+Unaligned AoS (Point3D - 24 Bytes):
+[ x0 | y0 | z0 | VPTR | PAD ][ x1 | y1 | z1 | VPTR | PAD ][ x2 | y2 | z2 | VPTR | PAD ...
+  ^-------- Point 0 --------^  ^-------- Point 1 --------^  ^-------- Point 2 --------^
 
 Aligned AoS (Point3D16 - 16 Bytes):
 [ x0 | y0 | z0 | PAD ][ x1 | y1 | z1 | PAD ][ x2 | y2 | z2 | PAD ][ x3 | y3 | z3 | PAD ]
   ^---- Point 0 ----^  ^---- Point 1 ----^  ^---- Point 2 ----^  ^---- Point 3 ----^
 ```
 
-Why did Unaligned (53ms) outperform Aligned (55ms) in your scalar loop?
+Why does Aligned (82ms) outperform Unaligned (100ms) now?
 CPU Cache Line Density: A standard CPU cache line is 64 bytes.
-Unaligned AoS: A 64-byte cache line can fit 5.33 points ($64 / 12$).
-Aligned AoS: A 64-byte cache line can fit exactly 4.0 points ($64 / 16$).
-Bandwidth Overhead: In your scalar loop, the CPU added the numbers sequentially using standard math instructions. The aligned version forces the CPU to fetch 33% more memory from RAM just to read the same amount of active point data because 25% of the cache line is useless padding.
-When Aligned is better: Alignment is highly beneficial when using explicit SIMD operations (like loading a point into a 128-bit vector register in a single CPU instruction without boundary splitting checks).
+* **Unaligned AoS (Point3D)**: Since `Point3D` contains a `virtual` destructor, it carries an 8-byte virtual table pointer (`vptr`), inflating the struct to **24 bytes** (after alignment padding). A 64-byte cache line can only fit **2.67 points** ($64 / 24$).
+* **Aligned AoS (Point3D16)**: Without any virtual destructor, `Point3D16` has no `vptr`. Marked with `alignas(16)`, it is padded to **16 bytes**. A 64-byte cache line can fit exactly **4.0 points** ($64 / 16$).
+
+Because `Point3D16` is 33% smaller than `Point3D` and has no virtual pointer overhead, it significantly improves data density, reduces memory bandwidth usage, and results in a **~1.22x speedup** over Unaligned AoS.
 3. How does SIMD work under the hood?
 SIMD (Single Instruction, Multiple Data) is a hardware capability of your CPU cores. Modern CPUs have wide vector registers (128-bit SSE, 256-bit AVX, or 512-bit AVX-512).
 
@@ -174,14 +200,14 @@ Vector Register (YMM0):   [ x0 | x1 | x2 | x3 | x4 | x5 | x6 | x7 ]
                                 +    +    +    +    +    +    +    +
 Vector Accumulator (YMM1):[ s0 | s1 | s2 | s3 | s4 | s5 | s6 | s7 ]
 ```
-This is why your SoA benchmark finished in just 44ms compared to the naive 268ms (a 6.1x speedup!). The CPU executed a fraction of the total instructions.
+This is why your SoA benchmark finished in just 72ms compared to the naive 137ms (a 1.90x speedup!). The CPU executed a fraction of the total instructions.
 
 4. Stack vs. Heap: Will this eat Stack Memory?
 Absolutely not.
 
 Although the variable std::vector<Point3D> cloud is created on the stack inside main(), the vector's internal constructor allocates its storage dynamically on the heap.
 
-The stack only holds the 24-byte vector controller (the three memory address pointers). The entire 10-million-point payload (120 Megabytes) is fully allocated on the heap in a single contiguous block of memory. You will never experience a stack overflow from these container optimizations.
+The stack only holds the 24-byte vector controller (the three memory address pointers). The entire 100-million-point payload (1.2 to 2.4 Gigabytes depending on the struct layout) is fully allocated on the heap in a single contiguous block of memory. You will never experience a stack overflow from these container optimizations.
 
 5. Production Architecture: How Constrained Systems Aim for Speed
 In production systems (e.g., self-driving cars, robotics operating on LiDAR point clouds loaded dynamically at runtime), we never use the naive pointer allocation strategy.
