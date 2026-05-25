@@ -1,3 +1,5 @@
 *.out
 build/
 draft/
+
+settings.json
